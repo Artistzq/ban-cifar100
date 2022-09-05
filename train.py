@@ -9,6 +9,8 @@ author baiyu
 import os
 import sys
 import argparse
+import json
+import random
 import time
 from datetime import datetime
 
@@ -25,11 +27,17 @@ from torch.utils.tensorboard import SummaryWriter
 from conf import settings
 from utils import get_network, get_training_dataloader, get_test_dataloader, WarmUpLR, \
     most_recent_folder, most_recent_weights, last_epoch, best_acc_weights
+from my_utils.ban_utils import BANLoss
+from my_utils.progress_bar import progress_bar
+
 
 def train(epoch):
-
+    print("======> Training...")
     start = time.time()
     net.train()
+    correct = 0
+    total = 0
+    train_loss = 0
     for batch_index, (images, labels) in enumerate(cifar100_training_loader):
 
         if args.gpu:
@@ -38,10 +46,10 @@ def train(epoch):
 
         optimizer.zero_grad()
         outputs = net(images)
-        loss = loss_function(outputs, labels)
+        loss = loss_function(outputs, labels, images)
         loss.backward()
         optimizer.step()
-
+        
         n_iter = (epoch - 1) * len(cifar100_training_loader) + batch_index + 1
 
         last_layer = list(net.children())[-1]
@@ -50,20 +58,26 @@ def train(epoch):
                 writer.add_scalar('LastLayerGradients/grad_norm2_weights', para.grad.norm(), n_iter)
             if 'bias' in name:
                 writer.add_scalar('LastLayerGradients/grad_norm2_bias', para.grad.norm(), n_iter)
-
-        print('Training Epoch: {epoch} [{trained_samples}/{total_samples}]\tLoss: {:0.4f}\tLR: {:0.6f}'.format(
+        total += labels.size(0)
+        correct += outputs.max(1)[1].eq(labels).sum().item()
+        msg = 'Epoch: {:3} | Loss: {:0.4f} | ACC: {:0.2f} | LR: {:0.6f} | [{trained_samples}/{total_samples}]'.format(
+            epoch,
             loss.item(),
+            100.0 * correct / total,
             optimizer.param_groups[0]['lr'],
-            epoch=epoch,
             trained_samples=batch_index * args.b + len(images),
             total_samples=len(cifar100_training_loader.dataset)
-        ))
+        )
+        # print(msg)
+        progress_bar(batch_index, len(cifar100_training_loader), msg)
 
         #update training loss for each iteration
         writer.add_scalar('Train/loss', loss.item(), n_iter)
 
         if epoch <= args.warm:
             warmup_scheduler.step()
+
+        train_loss += loss.item()
 
     for name, param in net.named_parameters():
         layer, attr = os.path.splitext(name)
@@ -73,48 +87,44 @@ def train(epoch):
     finish = time.time()
 
     print('epoch {} training time consumed: {:.2f}s'.format(epoch, finish - start))
+    return 100.0 * correct / total, train_loss / len(cifar100_training_loader.dataset)
 
 @torch.no_grad()
 def eval_training(epoch=0, tb=True):
-
-    start = time.time()
     net.eval()
 
     test_loss = 0.0 # cost function error
     correct = 0.0
+    total = 0
 
-    for (images, labels) in cifar100_test_loader:
+    print('======> Evaluating Network.....')
+    for idx, (images, labels) in enumerate(cifar100_test_loader):
 
         if args.gpu:
             images = images.cuda()
             labels = labels.cuda()
 
         outputs = net(images)
-        loss = loss_function(outputs, labels)
+        loss = loss_function(outputs, labels, images)
 
         test_loss += loss.item()
         _, preds = outputs.max(1)
-        correct += preds.eq(labels).sum()
-
-    finish = time.time()
-    if args.gpu:
-        print('GPU INFO.....')
-        print(torch.cuda.memory_summary(), end='')
-    print('Evaluating Network.....')
-    print('Test set: Epoch: {}, Average loss: {:.4f}, Accuracy: {:.4f}, Time consumed:{:.2f}s'.format(
-        epoch,
-        test_loss / len(cifar100_test_loader.dataset),
-        correct.float() / len(cifar100_test_loader.dataset),
-        finish - start
-    ))
+        correct += preds.eq(labels).sum().item()
+        total += labels.size(0)
+        msg = 'Epoch: {:3} | Loss: {:.4f} | ACC: {:.2f}'.format(
+            epoch,
+            test_loss / len(cifar100_test_loader.dataset),
+            100.0 * correct / total,
+        )
+        progress_bar(idx, len(cifar100_test_loader), msg)
+    
     print()
-
     #add informations to tensorboard
     if tb:
         writer.add_scalar('Test/Average loss', test_loss / len(cifar100_test_loader.dataset), epoch)
-        writer.add_scalar('Test/Accuracy', correct.float() / len(cifar100_test_loader.dataset), epoch)
+        writer.add_scalar('Test/Accuracy', correct / len(cifar100_test_loader.dataset), epoch)
 
-    return correct.float() / len(cifar100_test_loader.dataset)
+    return 100.0 * correct / len(cifar100_test_loader.dataset), test_loss / len(cifar100_test_loader.dataset)
 
 if __name__ == '__main__':
 
@@ -125,7 +135,18 @@ if __name__ == '__main__':
     parser.add_argument('-warm', type=int, default=1, help='warm up training phase')
     parser.add_argument('-lr', type=float, default=0.1, help='initial learning rate')
     parser.add_argument('-resume', action='store_true', default=False, help='resume training')
+    parser.add_argument('-tp', type=str, default=None, help='teacher path for ban')
+    parser.add_argument('-add_info', type=str, default=None, help='additional information for model for saving')
+    parser.add_argument('-seed', type=int, default=42)
     args = parser.parse_args()
+
+    # 取消随机性
+    if args.seed > 0:
+        torch.manual_seed(args.seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        np.random.seed(args.seed)
+        random.seed(args.seed)
 
     net = get_network(args)
 
@@ -146,21 +167,32 @@ if __name__ == '__main__':
         shuffle=True
     )
 
-    loss_function = nn.CrossEntropyLoss()
-    optimizer = optim.SGD(net.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
-    train_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=settings.MILESTONES, gamma=0.2) #learning rate decay
-    iter_per_epoch = len(cifar100_training_loader)
-    warmup_scheduler = WarmUpLR(optimizer, iter_per_epoch * args.warm)
-
     if args.resume:
         recent_folder = most_recent_folder(os.path.join(settings.CHECKPOINT_PATH, args.net), fmt=settings.DATE_FORMAT)
         if not recent_folder:
             raise Exception('no recent folder were found')
-
         checkpoint_path = os.path.join(settings.CHECKPOINT_PATH, args.net, recent_folder)
-
     else:
-        checkpoint_path = os.path.join(settings.CHECKPOINT_PATH, args.net, settings.TIME_NOW)
+        # checkpoint_path = os.path.join(settings.CHECKPOINT_PATH, args.net, settings.TIME_NOW)
+        checkpoint_path = os.path.join(settings.CHECKPOINT_PATH, args.net)
+
+    if args.tp is None:
+        teacher = None
+    else:
+        teacher = get_network(args)
+        path = os.path.join(checkpoint_path, '{net}-{epoch}-{type}-{add_info}.pth'.format(
+            net = args.net,
+            epoch = settings.EPOCH,
+            type = "regular",
+            add_info = args.tp
+        ))
+        teacher.load_state_dict(torch.load(path))
+    
+    loss_function = BANLoss(nn.CrossEntropyLoss(), teacher)
+    optimizer = optim.SGD(net.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
+    train_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=settings.MILESTONES, gamma=0.2) #learning rate decay
+    iter_per_epoch = len(cifar100_training_loader)
+    warmup_scheduler = WarmUpLR(optimizer, iter_per_epoch * args.warm)
 
     #use tensorboard
     if not os.path.exists(settings.LOG_DIR):
@@ -178,7 +210,11 @@ if __name__ == '__main__':
     #create checkpoint folder to save model
     if not os.path.exists(checkpoint_path):
         os.makedirs(checkpoint_path)
-    checkpoint_path = os.path.join(checkpoint_path, '{net}-{epoch}-{type}.pth')
+
+    if args.add_info:
+        checkpoint_path = os.path.join(checkpoint_path, '{net}-{epoch}-{type}-' + args.add_info + '.pth')
+    else:
+        checkpoint_path = os.path.join(checkpoint_path, '{net}-{epoch}-{type}.pth')
 
     best_acc = 0.0
     if args.resume:
@@ -200,7 +236,7 @@ if __name__ == '__main__':
 
         resume_epoch = last_epoch(os.path.join(settings.CHECKPOINT_PATH, args.net, recent_folder))
 
-
+    all_records = []
     for epoch in range(1, settings.EPOCH + 1):
         if epoch > args.warm:
             train_scheduler.step(epoch)
@@ -209,20 +245,25 @@ if __name__ == '__main__':
             if epoch <= resume_epoch:
                 continue
 
-        train(epoch)
-        acc = eval_training(epoch)
-
+        # 保存 acc loss
+        train_acc, train_loss = train(epoch)
+        test_acc, test_loss = eval_training(epoch)
+        log_path = (checkpoint_path[:-4] + ".log").format(net=args.net, epoch=settings.EPOCH, type='regular')
+        log = {"epoch": epoch, "train_acc": train_acc, "train_loss": train_loss, "test_acc": test_acc, "test_loss": test_loss}
+        all_records.append(log)
+        json.dump(all_records, open(log_path, "w"), indent=4)
+            
         #start to save best performance model after learning rate decay to 0.01
-        if epoch > settings.MILESTONES[1] and best_acc < acc:
+        if epoch > settings.MILESTONES[1] and best_acc < test_acc:
             weights_path = checkpoint_path.format(net=args.net, epoch=epoch, type='best')
             print('saving weights file to {}'.format(weights_path))
             torch.save(net.state_dict(), weights_path)
-            best_acc = acc
+            best_acc = test_acc
             continue
 
         if not epoch % settings.SAVE_EPOCH:
             weights_path = checkpoint_path.format(net=args.net, epoch=epoch, type='regular')
             print('saving weights file to {}'.format(weights_path))
             torch.save(net.state_dict(), weights_path)
-
+    print("==========================DONE========================\n\n\n")
     writer.close()

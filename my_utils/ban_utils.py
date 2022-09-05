@@ -4,12 +4,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-def get_teacher(path):
-    if not isinstance(path, str):
-        return path
-    return torch.load(path)
-
-
 class BANLoss:
     def __init__(self, criterion, teacher=None):
         self.teacher = teacher
@@ -25,7 +19,7 @@ class BANLoss:
 
     def kd_loss(self, outputs, labels, teacher_outputs, alpha=0.8, T=4):
         KD_loss = (1. - alpha) * F.cross_entropy(outputs, labels) + \
-            nn.KLDivLoss()(
+            nn.KLDivLoss(reduction = "batchmean")(
                 F.log_softmax(outputs/T, dim=1), 
                 F.softmax(teacher_outputs/T, dim=1)
             ) * alpha * T * T
